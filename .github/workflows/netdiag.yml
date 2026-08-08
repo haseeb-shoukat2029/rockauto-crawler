@@ -1,0 +1,65 @@
+# netdiag.yml — is the runner actually blocked, or is our own code the problem?
+#
+# The fleet reports ~1% live and we concluded RockAuto blackholed GitHub's Azure ranges.
+# That conclusion rests on ONE signal: the preflight's curl times out. But a timeout is
+# also what you'd see from a DNS failure, an IPv6 stall, a bad probe URL, or an egress
+# policy on the runner. Before spending money on GCP we should prove which it is.
+#
+# Each job here answers one question and prints the answer. NO crawling, ONE request per
+# probe, 6 jobs total — this cannot itself burn IP reputation.
+name: netdiag
+
+on:
+  workflow_dispatch: {}
+
+jobs:
+  diag:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    strategy:
+      fail-fast: false
+      matrix:
+        index: [0, 1, 2, 3, 4, 5]
+    steps:
+      - name: Network diagnosis
+        run: |
+          UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36'
+          echo "=== runner identity ==="
+          EIP=$(curl -s --max-time 8 https://api.ipify.org || echo '?')
+          echo "egress_ip=$EIP"
+          echo "region=$(curl -s -H Metadata:true --max-time 5 'http://169.254.169.254/metadata/instance/compute/location?api-version=2021-02-01&format=text' 2>/dev/null || echo '?')"
+
+          echo "=== 1. is general egress working at all? (control) ==="
+          curl -s -o /dev/null --max-time 10 -w "  example.com     http=%{http_code} connect=%{time_connect}s\n" https://example.com || echo "  example.com FAILED"
+          curl -s -o /dev/null --max-time 10 -w "  cloudflare.com  http=%{http_code} connect=%{time_connect}s\n" https://www.cloudflare.com || echo "  cloudflare FAILED"
+
+          echo "=== 2. DNS: what does rockauto resolve to from here? ==="
+          getent ahosts www.rockauto.com | sort -u | sed 's/^/  /' || echo "  DNS FAILED"
+          echo "  --- is there an AAAA (IPv6) record? an IPv6 stall looks exactly like a block ---"
+          getent ahostsv6 www.rockauto.com | head -3 | sed 's/^/  v6: /' || echo "  no IPv6 (good)"
+
+          echo "=== 3. bare TCP to each front-end, no HTTP, no TLS ==="
+          for A in 135.135.84.147 135.135.84.150 69.174.175.195 69.174.175.196; do
+            if timeout 6 bash -c "cat < /dev/null > /dev/tcp/$A/443" 2>/dev/null; then
+              echo "  $A:443 TCP OPEN"
+            else
+              echo "  $A:443 TCP BLOCKED"
+            fi
+          done
+
+          echo "=== 4. forced IPv4 HTTPS to the homepage (not the deep probe URL) ==="
+          curl -s -4 -o /dev/null --max-time 15 -A "$UA" \
+            -w "  homepage http=%{http_code} connect=%{time_connect}s size=%{size_download}\n" \
+            https://www.rockauto.com/ || echo "  homepage FAILED"
+
+          echo "=== 5. the exact deep URL the preflight uses ==="
+          curl -s -4 -o /tmp/p.html --compressed --max-time 15 -A "$UA" \
+            -w "  deepprobe http=%{http_code} connect=%{time_connect}s size=%{size_download}\n" \
+            'https://www.rockauto.com/en/catalog/ac,1947,two-litre,2.0l+122cid+l6,1486554,cooling+system,coolant+/+antifreeze,11393' \
+            || echo "  deepprobe FAILED"
+          echo "  markers=$(grep -c 'ranavnode\|navlabellink\|listing-\|nchildren' /tmp/p.html 2>/dev/null || echo 0)"
+
+          echo "=== 6. does a plain browser-ish request work where the crawler's does not? ==="
+          curl -s -4 -o /dev/null --max-time 15 \
+            -H 'Accept: text/html,application/xhtml+xml' -H 'Accept-Language: en-US,en;q=0.9' \
+            -A "$UA" -w "  plainget http=%{http_code}\n" https://www.rockauto.com/en/catalog/ || echo "  plainget FAILED"
